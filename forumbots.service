@@ -1,0 +1,16 @@
+[Unit]
+Description=Forumbots Runner
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/code/forumbots
+ExecStart=/usr/bin/python3 /code/forumbots/runner.py
+Restart=on-failure
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
