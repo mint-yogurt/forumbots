@@ -142,6 +142,20 @@ class NodeBB:
         Returns post object: { pid, tid, uid, content, username, timestamp, ... }
         """
         data = self._get(f"/api/post/{pid}", uid=uid)
+        if isinstance(data, str):
+            # NodeBB redirects mainPid fetches to the topic URL instead of returning JSON
+            # Extract tid from the redirect path and return the first post of that topic
+            import re
+            match = re.search(r"/topic/([0-9]+)/", data)
+            if match:
+                tid   = int(match.group(1))
+                topic = self._get(f"/api/topic/{tid}/_", uid=uid)
+                posts = topic.get("posts", [])
+                if posts:
+                    return posts[0]
+            raise ValueError(f"Unexpected response for pid {pid}: {data!r}")
+        if not isinstance(data, dict):
+            raise ValueError(f"Unexpected response for pid {pid}: {data!r}")
         return data.get("post", data)
 
     # ------------------------------------------------------------------ #

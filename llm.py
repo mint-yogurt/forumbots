@@ -32,7 +32,7 @@ AIHORDE_POLL_SEC    = 5    # seconds between status polls
 AIHORDE_TIMEOUT_SEC = 300  # give up after this many seconds
 
 OLLAMA_BASE   = "http://localhost:11434"
-OLLAMA_MODEL  = "llama3"  # default; override with "llm_model" in persona JSON
+OLLAMA_MODEL  = "gemma3:12b"  # default; override with "llm_model" in persona JSON
 
 # Shared generation params for AI Horde
 AIHORDE_PARAMS = {
@@ -49,6 +49,18 @@ OLLAMA_OPTIONS = {
     "top_p":       0.9,
     "top_k":       100,
 }
+
+# ------------------------------------------------------------------ #
+# Output cleanup
+# ------------------------------------------------------------------ #
+
+def clean_output(text: str) -> str:
+    import re
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
 
 # ------------------------------------------------------------------ #
 # AI Horde provider
@@ -118,6 +130,7 @@ class AIHordeProvider:
                 if not generations:
                     raise ValueError("AI Horde: no workers available to handle this request")
                 text = generations[0].get("text", "").strip()
+                text = clean_output(text)
                 log.info(f"AI Horde job {request_id} complete ({len(text)} chars)")
                 return text
 
@@ -130,7 +143,8 @@ class AIHordeProvider:
 # Ollama provider
 # ------------------------------------------------------------------ #
 
-class OllamaProvider:
+class OllamaLocalProvider:
+    """Ollama running locally at localhost."""
 
     def __init__(self, model: str = OLLAMA_MODEL):
         self.url   = f"{OLLAMA_BASE}/api/chat"
@@ -151,6 +165,68 @@ class OllamaProvider:
         return resp.json()["message"]["content"].strip()
 
 
+class OllamaCloudProvider:
+    """Ollama cloud API at ollama.com via raw requests."""
+
+    def __init__(self, model: str = OLLAMA_MODEL):
+        self.model   = model
+        self.url     = "https://ollama.com/api/chat"
+        self.headers = {
+            "Authorization": f"Bearer {secrets.OLLAMA_API_KEY}",
+            "Content-Type":  "application/json",
+        }
+
+    def generate(self, system_prompt: str, user_prompt: str) -> str:
+        payload = {
+            "model":  self.model,
+            "stream": False,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_prompt},
+            ],
+        }
+        resp = requests.post(self.url, json=payload, headers=self.headers, timeout=120)
+        resp.raise_for_status()
+        return resp.json()["message"]["content"].strip()
+
+
+# ------------------------------------------------------------------ #
+# Mistral provider
+# ------------------------------------------------------------------ #
+
+MISTRAL_URL          = "https://api.mistral.ai/v1/chat/completions"
+MISTRAL_DEFAULT_MODEL = "mistral-small-latest"
+
+class MistralProvider:
+    """
+    Mistral cloud API - OpenAI-compatible chat completions.
+    Model set via persona llm_model field:
+        "mistral-small-latest"  - fast, cheap, well-behaved
+        "open-mistral-nemo"     - open-weight, less filtered, more unpredictable
+    """
+
+    def __init__(self, model: str = MISTRAL_DEFAULT_MODEL):
+        self.model   = model
+        self.headers = {
+            "Authorization": f"Bearer {secrets.MISTRAL_API_KEY}",
+            "Content-Type":  "application/json",
+        }
+
+    def generate(self, system_prompt: str, user_prompt: str) -> str:
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user",   "content": user_prompt},
+            ],
+            "temperature": 0.9,
+            "max_tokens":  500,
+        }
+        resp = requests.post(MISTRAL_URL, json=payload, headers=self.headers, timeout=60)
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"].strip()
+
+
 # ------------------------------------------------------------------ #
 # Router
 # ------------------------------------------------------------------ #
@@ -160,28 +236,33 @@ def generate(persona: dict, system_prompt: str, user_prompt: str) -> str:
     username     = persona.get("username", "unknown")
 
     if provider_key == "koboldai":
-        # Build model list from persona JSON
-        # Accepts "llm_model" (str) or "llm_models" (list), or neither (any worker)
         if "llm_models" in persona:
             models = persona["llm_models"]
         elif "llm_model" in persona:
             models = [persona["llm_model"]]
         else:
-            models = []  # AI Horde will use any available worker
-
+            models = []
         provider = AIHordeProvider(api_key=AIHORDE_APIKEY, models=models)
 
     elif provider_key == "ollama":
         model = persona.get("llm_model", OLLAMA_MODEL)
-        provider = OllamaProvider(model=model)
+        provider = OllamaCloudProvider(model=model)
+
+    elif provider_key == "ollama_local":
+        model = persona.get("llm_model", OLLAMA_MODEL)
+        provider = OllamaLocalProvider(model=model)
+
+    elif provider_key == "mistral":
+        model = persona.get("llm_model", MISTRAL_DEFAULT_MODEL)
+        provider = MistralProvider(model=model)
 
     else:
         raise ValueError(
             f"[{username}] Unknown LLM provider '{provider_key}'. "
-            f"Valid options: koboldai, ollama"
+            f"Valid options: koboldai, ollama, ollama_local, mistral"
         )
 
-    log.debug(f"[{username}] Calling provider: {provider_key}")
+    log.debug(f"[{username}] Calling provider: {provider_key} model: {getattr(provider, 'model', '?')} ")
     text = provider.generate(system_prompt, user_prompt)
 
     if not text:
